@@ -17,6 +17,8 @@ jobs:
   publish:
     timeout-minutes: 10
     runs-on: ubuntu-24.04
+    env:
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
     permissions:
       contents: read
       id-token: write
@@ -40,10 +42,10 @@ jobs:
             exit 1
           fi
       - name: Publish with bootstrap token
-        if: ${{ secrets.NPM_TOKEN != '' }}
+        if: ${{ env.NPM_TOKEN != '' }}
         shell: bash
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ env.NPM_TOKEN }}
         run: |
           if [[ "${{ inputs.pre_release }}" == "true" ]]; then
             npm publish --tag beta --provenance
@@ -51,7 +53,7 @@ jobs:
             npm publish --provenance
           fi
       - name: Publish with trusted publisher
-        if: ${{ secrets.NPM_TOKEN == '' }}
+        if: ${{ env.NPM_TOKEN == '' }}
         shell: bash
         run: |
           if [[ "${{ inputs.pre_release }}" == "true" ]]; then
