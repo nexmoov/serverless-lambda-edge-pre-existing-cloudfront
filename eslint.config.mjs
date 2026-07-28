@@ -1,11 +1,10 @@
-import importPlugin from 'eslint-plugin-import'
+import { flatConfigs as importConfigs } from 'eslint-plugin-import-x'
 import prettier from 'eslint-plugin-prettier/recommended'
-import { createTypeScriptImportResolver } from 'eslint-import-resolver-typescript'
 import tsESLint from 'typescript-eslint'
 import { defineConfig, globalIgnores } from 'eslint/config'
 import globals from 'globals'
 export default defineConfig([
-  importPlugin.flatConfigs.recommended,
+  importConfigs.recommended,
   prettier,
   tsESLint.configs.recommended,
   {
@@ -16,13 +15,6 @@ export default defineConfig([
       ecmaVersion: 2017,
       sourceType: 'module',
       parserOptions: {}
-    },
-    settings: {
-      'import/resolver': {
-        typescript: createTypeScriptImportResolver({
-          project: './tsconfig.json'
-        })
-      }
     },
     rules: {
       'array-bracket-spacing': [
@@ -37,6 +29,7 @@ export default defineConfig([
       'arrow-parens': ['error', 'always'],
       'comma-dangle': ['error', 'never'],
       'func-names': 'off',
+      'import-x/named': 'off',
       'no-use-before-define': 'off',
       'prefer-destructuring': 'off',
       'no-console': 'error',
