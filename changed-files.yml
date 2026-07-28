@@ -1,8 +1,7 @@
 src:
   - src/**
+  - test/**
   - .npmignore
   - package.json
-  - yarn.lock
-  - .yarnrc.yml
-  - .yarn/**
+  - package-lock.json
   - changed-files.yml

@@ -50,5 +50,11 @@ export default defineConfig([
       'prefer-const': 'error'
     }
   },
-  globalIgnores(['dist/', '.yarn/'])
+  {
+    files: ['test/**/*.js'],
+    rules: {
+      '@typescript-eslint/no-require-imports': 'off'
+    }
+  },
+  globalIgnores(['dist/'])
 ])
