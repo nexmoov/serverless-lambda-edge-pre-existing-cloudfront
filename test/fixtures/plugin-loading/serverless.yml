@@ -1,0 +1,20 @@
+service: plugin-loading
+frameworkVersion: '^4.0.0'
+
+plugins:
+  - ./plugin/index.js
+
+provider:
+  name: aws
+  runtime: nodejs22.x
+  region: us-east-1
+
+functions:
+  edge:
+    handler: handler.handler
+    events:
+      - preExistingCloudFront:
+          distributionId: EXAMPLE
+          eventType: viewer-request
+          pathPattern: '*'
+          includeBody: false
