@@ -1,5 +1,6 @@
 import { CloudFormationClient, ListExportsCommand } from '@aws-sdk/client-cloudformation'
 import {
+  CacheBehaviors,
   CloudFrontClient,
   EventType,
   GetDistributionCommand,
@@ -23,6 +24,15 @@ interface PreExistingCloudFrontEvent extends AwsProvider.Event {
   }
 }
 
+interface Association {
+  preExistingCloudFront: PreExistingCloudFrontEvent['preExistingCloudFront']
+  functionArn: string
+}
+
+// CloudFront's write APIs have a low account-wide rate limit shared with every other deploy, and
+// the SDK default (3 attempts, ~1s total delay) gives up before the limit resets.
+const CLOUDFRONT_MAX_ATTEMPTS = 10
+
 export default class ServerlessLambdaEdgePreExistingCloudFront implements ServerlessPlugin {
   public hooks: Hooks
   private readonly log: Logging['log']
@@ -38,7 +48,9 @@ export default class ServerlessLambdaEdgePreExistingCloudFront implements Server
       region: this.region
     })
     this.cloudfrontClient = new CloudFrontClient({
-      region: this.region
+      region: this.region,
+      retryMode: 'adaptive',
+      maxAttempts: CLOUDFRONT_MAX_ATTEMPTS
     })
 
     this.cloudformationClient = new CloudFormationClient({
@@ -94,63 +106,76 @@ export default class ServerlessLambdaEdgePreExistingCloudFront implements Server
       return functionObj.events
     })
 
+    const associationsByDistribution = new Map<string, Association[]>()
     for (const functionName of functionNames) {
       const functionObj = this.serverless.service.getFunction(functionName)
       const events: PreExistingCloudFrontEvent[] = functionObj.events.filter(
         (event: PreExistingCloudFrontEvent) =>
-          event.preExistingCloudFront && this.checkAllowedDeployStage()
+          event.preExistingCloudFront &&
+          this.checkAllowedDeployStage() &&
+          (event.preExistingCloudFront.stage === undefined ||
+            event.preExistingCloudFront.stage == `${this.serverless.service.provider.stage}`)
       )
-      for (const event of events) {
-        if (
-          event.preExistingCloudFront.stage !== undefined &&
-          event.preExistingCloudFront.stage != `${this.serverless.service.provider.stage}`
-        ) {
-          continue
-        }
+      if (events.length === 0) {
+        continue
+      }
 
-        const functionArn = await this.getlatestVersionLambdaArn(functionObj.name)
+      const functionArn = await this.getlatestVersionLambdaArn(functionObj.name)
+      for (const event of events) {
         const resolvedDistributionId = await (event.preExistingCloudFront.distributionId[
           'Fn::ImportValue'
         ]
           ? this.resolveCfImportValue(event.preExistingCloudFront.distributionId['Fn::ImportValue'])
           : event.preExistingCloudFront.distributionId)
         this.log.notice(
-          `${functionArn} (Event: ${event.preExistingCloudFront.eventType}, pathPattern: ${event.preExistingCloudFront.pathPattern}) is associating to ${resolvedDistributionId} CloudFront Distribution. waiting for deployed status.`
+          `${functionArn} (Event: ${event.preExistingCloudFront.eventType}, pathPattern: ${event.preExistingCloudFront.pathPattern}) is associating to ${resolvedDistributionId} CloudFront Distribution.`
         )
 
-        await this.updateDistribution(
-          event.preExistingCloudFront,
-          resolvedDistributionId,
-          functionArn
-        )
+        const associations = associationsByDistribution.get(resolvedDistributionId) ?? []
+        associations.push({ preExistingCloudFront: event.preExistingCloudFront, functionArn })
+        associationsByDistribution.set(resolvedDistributionId, associations)
       }
+    }
+
+    for (const [distributionId, associations] of associationsByDistribution) {
+      await this.updateDistribution(distributionId, associations)
     }
   }
 
   private async updateDistribution(
-    preExistingCloudFront: PreExistingCloudFrontEvent['preExistingCloudFront'],
     resolvedDistributionId: string,
-    functionArn: string,
+    associations: Association[],
     retryCount = 5
   ) {
     const config = await this.cloudfrontClient.send(
       new GetDistributionCommand({ Id: resolvedDistributionId })
     )
+    const distributionConfig = config.Distribution.DistributionConfig
 
-    if (preExistingCloudFront.pathPattern === '*') {
-      config.Distribution.DistributionConfig.DefaultCacheBehavior.LambdaFunctionAssociations =
-        await this.associateFunction(
-          config.Distribution.DistributionConfig.DefaultCacheBehavior.LambdaFunctionAssociations,
-          preExistingCloudFront,
-          functionArn
-        )
-    } else {
-      config.Distribution.DistributionConfig.CacheBehaviors =
-        await this.associateNonDefaultCacheBehaviors(
-          config.Distribution.DistributionConfig.CacheBehaviors,
-          preExistingCloudFront,
-          functionArn
-        )
+    let changed = false
+    for (const { preExistingCloudFront, functionArn } of associations) {
+      if (preExistingCloudFront.pathPattern === '*') {
+        changed =
+          this.associateFunction(
+            distributionConfig.DefaultCacheBehavior.LambdaFunctionAssociations,
+            preExistingCloudFront,
+            functionArn
+          ) || changed
+      } else {
+        changed =
+          this.associateNonDefaultCacheBehaviors(
+            distributionConfig.CacheBehaviors,
+            preExistingCloudFront,
+            functionArn
+          ) || changed
+      }
+    }
+
+    if (!changed) {
+      this.log.notice(
+        `${resolvedDistributionId} CloudFront Distribution already has these associations, skipping update.`
+      )
+      return
     }
 
     await this.cloudfrontClient
@@ -158,7 +183,7 @@ export default class ServerlessLambdaEdgePreExistingCloudFront implements Server
         new UpdateDistributionCommand({
           Id: resolvedDistributionId,
           IfMatch: config.ETag,
-          DistributionConfig: config.Distribution.DistributionConfig
+          DistributionConfig: distributionConfig
         })
       )
       .catch(async (error) => {
@@ -167,12 +192,7 @@ export default class ServerlessLambdaEdgePreExistingCloudFront implements Server
           retryCount -= 1
 
           await setTimeout(5000)
-          return this.updateDistribution(
-            preExistingCloudFront,
-            resolvedDistributionId,
-            functionArn,
-            retryCount
-          )
+          return this.updateDistribution(resolvedDistributionId, associations, retryCount)
         }
         this.log.error(error)
         throw error
@@ -188,39 +208,54 @@ export default class ServerlessLambdaEdgePreExistingCloudFront implements Server
     return true
   }
 
-  private async associateNonDefaultCacheBehaviors(
-    cacheBehaviors,
+  private associateNonDefaultCacheBehaviors(
+    cacheBehaviors: CacheBehaviors,
     preExistingCloudFront: PreExistingCloudFrontEvent['preExistingCloudFront'],
-    functionArn
+    functionArn: string
   ) {
+    let changed = false
     for (const cacheBehavior of cacheBehaviors.Items) {
       if (preExistingCloudFront.pathPattern === cacheBehavior.PathPattern) {
-        cacheBehavior.LambdaFunctionAssociations = await this.associateFunction(
-          cacheBehavior.LambdaFunctionAssociations,
-          preExistingCloudFront,
-          functionArn
-        )
+        changed =
+          this.associateFunction(
+            cacheBehavior.LambdaFunctionAssociations,
+            preExistingCloudFront,
+            functionArn
+          ) || changed
       }
     }
-    return cacheBehaviors
+    return changed
   }
 
-  private async associateFunction(
+  /**
+   * Points the `eventType` association of `lambdaFunctionAssociations` at `functionArn`, in place.
+   *
+   * @returns whether the associations changed; false when that association was already in place.
+   */
+  private associateFunction(
     lambdaFunctionAssociations: LambdaFunctionAssociations,
     preExistingCloudFront: PreExistingCloudFrontEvent['preExistingCloudFront'],
     functionArn: string
   ) {
-    const originals = lambdaFunctionAssociations.Items.filter(
+    const items = lambdaFunctionAssociations.Items ?? []
+    const existing = items.find((x) => x.EventType === preExistingCloudFront.eventType)
+    if (
+      existing?.LambdaFunctionARN === functionArn &&
+      existing.IncludeBody === preExistingCloudFront.includeBody
+    ) {
+      return false
+    }
+
+    lambdaFunctionAssociations.Items = items.filter(
       (x) => x.EventType !== preExistingCloudFront.eventType
     )
-    lambdaFunctionAssociations.Items = originals
     lambdaFunctionAssociations.Items.push({
       LambdaFunctionARN: functionArn,
       IncludeBody: preExistingCloudFront.includeBody,
       EventType: preExistingCloudFront.eventType
     })
     lambdaFunctionAssociations.Quantity = lambdaFunctionAssociations.Items.length
-    return lambdaFunctionAssociations
+    return true
   }
 
   private async getlatestVersionLambdaArn(functionName: string, marker?: string) {
